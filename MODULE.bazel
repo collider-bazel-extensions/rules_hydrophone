@@ -1,0 +1,45 @@
+"""rules_hydrophone: Kubernetes conformance as a Bazel test, with hydrophone.
+
+  hydrophone_conformance_test - runs the conformance suite against the cluster
+                                named by KUBECONFIG; refuses a cluster whose
+                                Kubernetes minor differs from the image's
+
+Pinned: hydrophone 0.8.0 (upstream release binaries), kubectl 1.36.6 (the
+version check), registry.k8s.io/conformance by index digest for 1.35-1.37.
+"""
+
+module(
+    name = "rules_hydrophone",
+    version = "0.1.0",
+)
+
+bazel_dep(name = "bazel_skylib", version = "1.8.2")
+bazel_dep(name = "platforms", version = "1.0.0")
+
+# Public binary toolchain. The `hydrophone` extension creates
+# hydrophone_<platform> repos at the root module's hydrophone.version(), or
+# at this module's when the root names none.
+hydrophone = use_extension("//:extensions.bzl", "hydrophone")
+hydrophone.version(version = "0.8.0")
+use_repo(
+    hydrophone,
+    "hydrophone_darwin_amd64",
+    "hydrophone_darwin_arm64",
+    "hydrophone_linux_amd64",
+    "hydrophone_linux_arm64",
+)
+
+register_toolchains("@rules_hydrophone//toolchain:all")
+
+# ---- dev-only ---------------------------------------------------------------
+# Consumers inherit none of these.
+bazel_dep(name = "rules_shell", version = "0.8.0", dev_dependency = True)
+
+# The end-to-end test runs conformance specs against a real kind cluster.
+bazel_dep(name = "rules_kind", version = "0.5.0", dev_dependency = True)
+archive_override(
+    module_name = "rules_kind",
+    integrity = "sha256-zcdyDhCnoCxriIbCzgMKuApoIGZA2ZBoRHvb462WO3Q=",
+    strip_prefix = "rules_kind-0.5.0",
+    urls = ["https://github.com/collider-bazel-extensions/rules_kind/archive/refs/tags/v0.5.0.tar.gz"],
+)

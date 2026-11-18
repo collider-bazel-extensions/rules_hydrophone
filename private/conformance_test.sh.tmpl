@@ -1,0 +1,221 @@
+#!/usr/bin/env bash
+# rules_hydrophone: hydrophone_conformance_test wrapper, generated from
+# private/conformance_test.sh.tmpl (__KEY__ markers are substituted by the rule).
+#
+#   1. KUBECONFIG: from --test_env, or from $TEST_TMPDIR/<env_file>.
+#   2. The cluster's version (pinned kubectl), compared with the image's
+#      minor. A mismatch fails here, before anything touches the cluster.
+#   3. hydrophone in a namespace of its own, in the background, so the
+#      TERM/INT traps run at once. A watchdog stops it shortly before
+#      $TEST_TIMEOUT, to leave time for cleanup.
+#   4. hydrophone --cleanup for that namespace, always (trap).
+#   5. Verdict: hydrophone exit 0, a JUnit report with specs run and no
+#      failures or errors, cleanup done.
+set -uo pipefail
+
+label=__LABEL__
+image=__IMAGE__
+image_minor=__IMAGE_MINOR__
+pinned_minors=__PINNED_MINORS__
+busybox_image=__BUSYBOX_IMAGE__
+parallel=__PARALLEL__
+focus=__FOCUS__
+skip=__SKIP__
+env_file=__ENV_FILE__
+hydrophone_version=__HYDROPHONE_VERSION__
+kubectl_version=__KUBECTL_VERSION__
+
+say() { echo "rules_hydrophone: $*"; }
+die() { echo "rules_hydrophone: $label: FAIL: $*" >&2; exit 1; }
+
+# ---- runfiles ---------------------------------------------------------------
+if [[ -z "${RUNFILES_DIR:-}" ]]; then
+  if [[ -n "${TEST_SRCDIR:-}" ]]; then RUNFILES_DIR="$TEST_SRCDIR"
+  elif [[ -d "$0.runfiles" ]]; then RUNFILES_DIR="$0.runfiles"
+  else die "no runfiles found; run it with bazel test"
+  fi
+fi
+rloc() { [[ -e "$RUNFILES_DIR/$1" ]] && echo "$RUNFILES_DIR/$1"; }
+hydrophone=$(rloc __HYDROPHONE__) || die "not in runfiles: "__HYDROPHONE__
+kubectl=$(rloc __KUBECTL__) || die "not in runfiles: "__KUBECTL__
+junit_check=$(rloc __JUNIT_CHECK__) || die "not in runfiles: "__JUNIT_CHECK__
+command -v python3 >/dev/null 2>&1 || die "python3 is not on PATH (it reads the JUnit report). Pass --test_env=PATH, or put python3 in /usr/bin."
+
+tmp="${TEST_TMPDIR:-}"
+if [[ -z "$tmp" ]]; then tmp=$(mktemp -d); fi
+out="${TEST_UNDECLARED_OUTPUTS_DIR:-$tmp/outputs}"
+mkdir -p "$out" "$tmp/hydrophone-cleanup" || die "cannot create $out"
+
+# ---- 1. KUBECONFIG -----------------------------------------------------------
+if [[ -n "$env_file" ]]; then
+  f="$tmp/$env_file"
+  [[ -f "$f" ]] || die "env_file = \"$env_file\": \$TEST_TMPDIR/$env_file does not exist. The cluster service writes it once the cluster is ready (rules_kind's kind_cluster writes <name>.env): run this test as the test of a service_test whose services include that cluster."
+  KUBECONFIG=$(unset KUBECONFIG; set -a; source "$f" >/dev/null 2>&1; printf '%s' "${KUBECONFIG:-}")
+  [[ -n "$KUBECONFIG" ]] || die "\$TEST_TMPDIR/$env_file sets no KUBECONFIG."
+  from="\$TEST_TMPDIR/$env_file"
+else
+  [[ -n "${KUBECONFIG:-}" ]] || die "KUBECONFIG is not set. Name the cluster under test explicitly: bazel test $label --test_env=KUBECONFIG=/absolute/path/to/kubeconfig"
+  from="--test_env"
+fi
+export KUBECONFIG
+case "$KUBECONFIG" in
+  *:*) die "KUBECONFIG=$KUBECONFIG lists several files; hydrophone reads one. Merge them into one file (kubectl config view --flatten > merged.kubeconfig)." ;;
+  /*) ;;
+  *) die "KUBECONFIG=$KUBECONFIG is not an absolute path (the test runs in its runfiles directory, not where you ran bazel)." ;;
+esac
+if [[ ! -f "$KUBECONFIG" || ! -r "$KUBECONFIG" ]]; then
+  hint=""
+  case "$KUBECONFIG" in
+    /tmp/*) hint=" Bazel's sandbox gives each test a private /tmp (--incompatible_sandbox_hermetic_tmp), so files under the host's /tmp are not visible: put the kubeconfig elsewhere (e.g. under \$HOME or the CI workspace), or run with --strategy=TestRunner=local." ;;
+  esac
+  die "KUBECONFIG=$KUBECONFIG (from $from) is not a readable file inside the test.$hint"
+fi
+say "$label: KUBECONFIG=$KUBECONFIG (from $from)"
+
+# ---- 2. version check ---------------------------------------------------------
+minor_of() {  # v1.35.4-eks-abcdef, v1.35.2-gke.100, 1.35 -> 1.35
+  if [[ "$1" =~ ^v?([0-9]+)\.([0-9]+) ]]; then
+    echo "$((10#${BASH_REMATCH[1]})).$((10#${BASH_REMATCH[2]}))"
+  fi
+}
+json_field() {  # <json> <key>: the first "key": "value" string
+  printf '%s\n' "$1" | sed -n 's/.*"'"$2"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1
+}
+
+say "reading the cluster's version (kubectl $kubectl_version get --raw /version)"
+if ! raw=$("$kubectl" --kubeconfig "$KUBECONFIG" --request-timeout=60s get --raw /version 2>"$tmp/kubectl.err"); then
+  cat "$tmp/kubectl.err" >&2
+  die "could not read the cluster's version through $KUBECONFIG (kubectl's error above). If the kubeconfig runs a credential plugin (users[].user.exec, such as 'aws eks get-token' or gke-gcloud-auth-plugin), the test needs it on PATH and its credentials in the environment: pass --test_env=PATH and the plugin's variables (for EKS, e.g. --test_env=AWS_PROFILE --test_env=AWS_REGION, or the AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN your CI exports)."
+fi
+server_version=$(json_field "$raw" gitVersion)
+server_minor=$(minor_of "$server_version")
+if [[ -z "$server_minor" ]]; then
+  # No usable gitVersion: fall back to major/minor ("35+" on some managed clusters).
+  major=$(json_field "$raw" major); minor=$(json_field "$raw" minor)
+  major=${major//[^0-9]/}; minor=${minor//[^0-9]/}
+  [[ -n "$major" && -n "$minor" ]] && server_minor="$((10#$major)).$((10#$minor))"
+fi
+[[ -n "$server_minor" ]] || die "could not parse the cluster's version from /version: $raw"
+say "cluster: Kubernetes $server_minor ($server_version); conformance image: Kubernetes $image_minor ($image)"
+
+if [[ "$server_minor" != "$image_minor" ]]; then
+  fix="a $server_minor conformance image pinned by digest (\"registry.k8s.io/conformance:v$server_minor.<patch>@sha256:<digest>\")"
+  for m in $pinned_minors; do
+    [[ "$m" == "$server_minor" ]] && fix="conformance_image = \"$server_minor\""
+  done
+  die "Kubernetes minor mismatch: the cluster runs $server_minor ($server_version) but the conformance image is for $image_minor ($image). Refusing to run: conformance is only meaningful with the cluster's own minor. Use $fix."
+fi
+
+# ---- 3. hydrophone -------------------------------------------------------------
+ns="hydrophone-$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')"
+args=(
+  --kubeconfig "$KUBECONFIG"
+  --namespace "$ns"
+  --conformance-image "$image"
+  --busybox-image "$busybox_image"
+  --output-dir "$out"
+  --parallel "$parallel"
+)
+if [[ -n "$focus" ]]; then args+=(--focus "$focus"); else args+=(--conformance); fi
+if [[ -n "$skip" ]]; then args+=(--skip "$skip"); fi
+
+# Leave time for cleanup before Bazel's own timeout (SIGTERM, then SIGKILL
+# after --local_termination_grace_seconds).
+margin=""; budget=""
+if [[ "${TEST_TIMEOUT:-}" =~ ^[0-9]+$ ]]; then
+  margin=$(( TEST_TIMEOUT / 10 ))
+  (( margin > 300 )) && margin=300
+  (( margin < 1 )) && margin=1
+  budget=$(( TEST_TIMEOUT - margin ))
+fi
+cleanup_timeout=${margin:-300}
+(( cleanup_timeout < 10 )) && cleanup_timeout=10
+
+# with_timeout <seconds> <cmd...>: no coreutils `timeout` (not on macOS).
+with_timeout() {
+  local secs="$1"; shift
+  "$@" &
+  local p=$!
+  ( trap 'kill "$s" 2>/dev/null; exit 0' TERM
+    sleep "$secs" & s=$!; wait "$s"; kill -TERM "$p" 2>/dev/null ) >/dev/null 2>&1 &
+  local w=$!
+  wait "$p"; local rc=$?
+  kill -TERM "$w" 2>/dev/null; wait "$w" 2>/dev/null
+  return "$rc"
+}
+
+armed=0; cleaned=0; cleanup_rc=0; hpid=""; wpid=""
+cleanup() {  # <timeout seconds>
+  (( armed && !cleaned )) || return 0
+  cleaned=1
+  say "cleanup: hydrophone --cleanup --namespace $ns"
+  # The images are unused by --cleanup; passing them keeps its log from
+  # naming hydrophone's server-version default instead.
+  with_timeout "$1" "$hydrophone" --cleanup --kubeconfig "$KUBECONFIG" --namespace "$ns" \
+      --conformance-image "$image" --busybox-image "$busybox_image" --output-dir "$tmp/hydrophone-cleanup"
+  cleanup_rc=$?
+  if (( cleanup_rc == 143 )); then
+    # Stopped by with_timeout. The ClusterRoleBinding, ClusterRole and
+    # namespace deletes go out first, so this was the wait for the namespace
+    # to finish terminating.
+    echo "rules_hydrophone: $label: hydrophone --cleanup was stopped after ${1}s while namespace $ns was still terminating (its ClusterRole and ClusterRoleBinding are deleted first). If 'kubectl get namespace $ns' still lists it later, run: hydrophone --cleanup --namespace $ns --kubeconfig <kubeconfig>" >&2
+  elif (( cleanup_rc != 0 )); then
+    echo "rules_hydrophone: $label: hydrophone --cleanup exited $cleanup_rc. Namespace $ns, ClusterRole conformance-serviceaccount:$ns and ClusterRoleBinding conformance-serviceaccount-role:$ns may be left behind; remove them with: hydrophone --cleanup --namespace $ns --kubeconfig <kubeconfig>" >&2
+  fi
+}
+on_signal() {  # <name> <number>
+  echo "rules_hydrophone: $label: received SIG$1: stopping hydrophone and cleaning up" >&2
+  if [[ -n "$hpid" ]]; then kill -TERM "$hpid" 2>/dev/null; wait "$hpid" 2>/dev/null; fi
+  if [[ -n "$wpid" ]]; then kill -TERM "$wpid" 2>/dev/null; fi
+  # Bazel allows --local_termination_grace_seconds (default 15) after
+  # SIGTERM. The deletes are issued within the first second; only the
+  # wait for the namespace to finish terminating is cut short.
+  cleanup 10
+  exit $(( 128 + $2 ))
+}
+trap 'on_signal TERM 15' TERM
+trap 'on_signal INT 2' INT
+trap 'cleanup "$cleanup_timeout"' EXIT
+
+specs="every [Conformance] spec"
+if [[ -n "$focus" ]]; then specs="focus '$focus'"; fi
+if [[ -n "$skip" ]]; then specs+=", skip '$skip'"; fi
+say "hydrophone $hydrophone_version: namespace $ns, parallel $parallel, $specs"
+say "reports: $out"
+armed=1
+"$hydrophone" "${args[@]}" &
+hpid=$!
+if [[ -n "$budget" ]]; then
+  ( trap 'kill "$s" 2>/dev/null; exit 0' TERM
+    sleep "$budget" & s=$!; wait "$s"
+    : > "$tmp/hydrophone.deadline"
+    kill -TERM "$hpid" 2>/dev/null ) >/dev/null 2>&1 &
+  wpid=$!
+fi
+wait "$hpid"; hrc=$?
+hpid=""
+if [[ -n "$wpid" ]]; then kill -TERM "$wpid" 2>/dev/null; wait "$wpid" 2>/dev/null; wpid=""; fi
+
+# ---- 4. cleanup ------------------------------------------------------------------
+cleanup "$cleanup_timeout"
+
+# ---- 5. verdict ------------------------------------------------------------------
+problems=()
+if [[ -f "$tmp/hydrophone.deadline" ]]; then
+  problems+=("hydrophone was stopped after ${budget}s, ${margin}s before the test's timeout (${TEST_TIMEOUT}s), to leave time for cleanup. A full conformance run takes an hour or more: raise the timeout, e.g. --test_timeout=7200 (README, \"Timeouts\").")
+fi
+(( hrc == 0 )) || problems+=("hydrophone exited $hrc.")
+junit="$out/junit_01.xml"
+if python3 -I "$junit_check" "$junit"; then
+  if [[ -n "${XML_OUTPUT_FILE:-}" ]]; then cp "$junit" "$XML_OUTPUT_FILE" 2>/dev/null || true; fi
+else
+  problems+=("the JUnit report ($junit) does not show a clean run (above).")
+fi
+(( cleanup_rc == 0 )) || problems+=("hydrophone --cleanup failed (exit $cleanup_rc); namespace $ns may be left behind.")
+
+if (( ${#problems[@]} )); then
+  for p in "${problems[@]}"; do echo "rules_hydrophone: $label: FAIL: $p" >&2; done
+  exit 1
+fi
+say "$label: PASS: conformance against Kubernetes $server_minor ($server_version) with $image"
+exit 0

@@ -1,0 +1,44 @@
+"""Private build files for rules_hydrophone. Public surface lives in
+//:defs.bzl, which re-exports from here."""
+
+load("@bazel_skylib//:bzl_library.bzl", "bzl_library")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files([
+    "conformance_test.sh.tmpl",
+    "junit_check.py",
+    "versions.bzl",
+])
+
+bzl_library(
+    name = "providers",
+    srcs = ["providers.bzl"],
+)
+
+bzl_library(
+    name = "versions",
+    srcs = ["versions.bzl"],
+)
+
+bzl_library(
+    name = "image",
+    srcs = ["image.bzl"],
+    deps = [":versions"],
+)
+
+bzl_library(
+    name = "conformance",
+    srcs = ["conformance.bzl"],
+    deps = [
+        ":image",
+        ":versions",
+        "//toolchain",
+    ],
+)
+
+bzl_library(
+    name = "repositories",
+    srcs = ["repositories.bzl"],
+    deps = [":versions"],
+)

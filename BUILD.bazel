@@ -1,0 +1,18 @@
+load("@bazel_skylib//:bzl_library.bzl", "bzl_library")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files([
+    "MODULE.bazel",
+    "defs.bzl",
+])
+
+bzl_library(
+    name = "defs",
+    srcs = ["defs.bzl"],
+    deps = [
+        "//private:conformance",
+        "//private:providers",
+        "//private:versions",
+    ],
+)

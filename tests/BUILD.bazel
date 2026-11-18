@@ -1,0 +1,144 @@
+"""Tests for rules_hydrophone.
+
+  - analysis_tests: conformance_image resolution and attribute errors;
+  - wrapper_test: the generated wrapper with stub hydrophone/kubectl (no cluster);
+  - checksums_test, version_test: the pins;
+  - kind_e2e_test (manual): a real kind cluster, a focus subset, a refused
+    mismatch and SIGTERM cleanup. Needs docker or podman.
+"""
+
+load("@rules_kind//:defs.bzl", "kind_cluster")
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
+load("//:defs.bzl", "hydrophone_conformance_test")
+load("//private:conformance.bzl", "hydrophone_conformance_stubbed_test")
+load(":analysis_tests.bzl", "analysis_test_suite")
+
+analysis_test_suite(name = "analysis_tests")
+
+# ---- the wrapper, with stubs ----------------------------------------------------
+# hydrophone_conformance_stubbed_test is the same rule with the
+# binaries replaceable; defs.bzl doesn't export it.
+
+hydrophone_conformance_stubbed_test(
+    name = "stub_135",
+    conformance_image = "1.35",
+    tags = ["manual"],
+    hydrophone = "stubs/fake_hydrophone.sh",
+    kubectl = "stubs/fake_kubectl.sh",
+)
+
+hydrophone_conformance_stubbed_test(
+    name = "stub_full",
+    conformance_image = "registry.example.com/mirror/conformance:v1.36.2@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    focus = "ConfigMap|Secrets",
+    parallel = 4,
+    skip = "Serial",
+    tags = ["manual"],
+    hydrophone = "stubs/fake_hydrophone.sh",
+    kubectl = "stubs/fake_kubectl.sh",
+)
+
+hydrophone_conformance_stubbed_test(
+    name = "stub_env_file",
+    conformance_image = "1.35",
+    env_file = "fake.env",
+    tags = ["manual"],
+    hydrophone = "stubs/fake_hydrophone.sh",
+    kubectl = "stubs/fake_kubectl.sh",
+)
+
+sh_test(
+    name = "wrapper_test",
+    srcs = ["wrapper_test.sh"],
+    args = [
+        "$(rootpath :stub_135)",
+        "$(rootpath :stub_full)",
+        "$(rootpath :stub_env_file)",
+    ],
+    data = [
+        ":stub_135",
+        ":stub_env_file",
+        ":stub_full",
+        "//private:versions.bzl",
+    ],
+)
+
+# ---- pins -----------------------------------------------------------------------
+
+sh_test(
+    name = "checksums_test",
+    srcs = ["checksums_test.sh"],
+    data = ["//private:versions.bzl"],
+)
+
+sh_test(
+    name = "version_test",
+    srcs = ["version_test.sh"],
+    args = [
+        "$(rootpath //private:versions.bzl)",
+        "$(rootpath //:MODULE.bazel)",
+        "$(rootpaths //toolchain:current)",
+    ],
+    data = [
+        "//:MODULE.bazel",
+        "//private:versions.bzl",
+        "//toolchain:current",
+    ],
+)
+
+# ---- end to end: a real kind cluster ------------------------------------------------
+# rules_kind v0.5.0's 1.35 node image is kindest/node v1.35.8, so the pinned
+# 1.35 conformance image matches and the 1.36 one must be refused.
+
+kind_cluster(
+    name = "conformance_cluster",
+    k8s_version = "1.35",
+    tags = [
+        "manual",
+        "no-sandbox",
+        "requires-docker",
+    ],
+)
+
+# Five fast [Conformance] specs that only talk to the API server (no pods
+# to pull images for), so the whole path runs in a few minutes.
+hydrophone_conformance_test(
+    name = "kind_focus_conformance",
+    conformance_image = "1.35",
+    env_file = "conformance_cluster.env",
+    focus = "|".join([
+        "server version should find the server version",
+        "Discovery should validate PreferredVersion for each APIGroup",
+        "ConfigMap should run through a ConfigMap lifecycle",
+        "Secrets should patch a secret",
+        "Services should find a service from listing all namespaces",
+    ]),
+)
+
+hydrophone_conformance_test(
+    name = "kind_mismatch_conformance",
+    conformance_image = "1.36",
+)
+
+sh_test(
+    name = "kind_e2e_test",
+    size = "large",
+    timeout = "eternal",
+    srcs = ["kind_e2e_test.sh"],
+    args = [
+        "$(rootpath :conformance_cluster)",
+        "$(rootpath :kind_focus_conformance)",
+        "$(rootpath :kind_mismatch_conformance)",
+    ],
+    data = [
+        ":conformance_cluster",
+        ":kind_focus_conformance",
+        ":kind_mismatch_conformance",
+    ],
+    tags = [
+        "external",
+        "manual",
+        "no-sandbox",
+        "requires-docker",
+    ],
+)

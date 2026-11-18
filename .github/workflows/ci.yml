@@ -1,0 +1,116 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: bazel test (ubuntu-latest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: bazel-contrib/setup-bazel@0.15.0
+        with:
+          bazelisk-cache: true
+          disk-cache: ${{ github.workflow }}
+          repository-cache: true
+
+      # The unit and analysis tests run in Bazel's linux-sandbox, which needs
+      # unprivileged user namespaces; Ubuntu 24.04's AppArmor restricts them
+      # by default.
+      - name: Allow the linux-sandbox
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+
+      - name: bazel build //...
+        run: bazel build //...
+
+      # Analysis tests, the wrapper with stub binaries (no cluster), the pins.
+      # The manual e2e runs in the kind job.
+      - name: bazel test //tests/...
+        run: bazel test //tests/... --test_output=errors
+
+      - name: Pins match upstream (tools/update_versions.sh --check)
+        run: tools/update_versions.sh --check
+
+      - name: Upload test logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bazel-testlogs
+          path: bazel-testlogs/
+          if-no-files-found: ignore
+
+  e2e:
+    # A focus subset of [Conformance] specs against a real kind cluster
+    # (rules_kind v0.5.0, Kubernetes 1.35), a refused 1.36 image, and SIGTERM
+    # cleanup.
+    name: e2e on kind (docker)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: bazel-contrib/setup-bazel@0.15.0
+        with:
+          bazelisk-cache: true
+          disk-cache: ${{ github.workflow }}-e2e
+          repository-cache: true
+
+      - name: Allow the linux-sandbox
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+
+      - name: Start a user systemd instance
+        # rules_kind's launcher runs its reaper as a `systemd-run --user`
+        # unit so a cluster is deleted even if the test is killed.
+        run: |
+          set -euo pipefail
+          sudo loginctl enable-linger "$USER"
+          for _ in 1 2 3 4 5 6 7 8 9 10; do
+            systemctl --user is-active default.target 2>/dev/null && break
+            sleep 1
+          done
+          systemctl --user is-active default.target
+
+      - name: bazel test //tests:kind_e2e_test
+        run: bazel test //tests:kind_e2e_test --test_output=streamed
+
+      - name: No kind clusters left behind
+        if: always()
+        run: |
+          set -euo pipefail
+          for _ in $(seq 1 60); do
+            left=$(docker ps -a --filter label=io.x-k8s.kind.cluster --format '{{.Names}}')
+            [[ -z "$left" ]] && { echo "no kind clusters left"; exit 0; }
+            sleep 2
+          done
+          echo "kind clusters left behind:"; echo "$left"; exit 1
+
+      - name: Upload test logs and outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bazel-testlogs-e2e
+          path: bazel-testlogs/tests/kind_e2e_test/
+          if-no-files-found: ignore
+
+  consumer:
+    # The release archive (git archive honours .gitattributes export-ignore,
+    # as GitHub's tag tarballs do) must load and analyze for a consumer.
+    name: consumer (ubuntu-latest, git archive)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: bazel-contrib/setup-bazel@0.15.0
+        with:
+          bazelisk-cache: true
+          repository-cache: true
+
+      - name: Allow the linux-sandbox
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+
+      - name: Consumer check
+        run: .github/consumer/check.sh "$RUNNER_TEMP/consumer"
