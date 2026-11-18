@@ -22,7 +22,7 @@ archive_override(
     module_name = "rules_hydrophone",
     urls = ["https://github.com/collider-bazel-extensions/rules_hydrophone/archive/refs/tags/v0.1.0.tar.gz"],
     strip_prefix = "rules_hydrophone-0.1.0",
-    integrity = "INTEGRITY_AFTER_TAG",
+    integrity = "sha256-mqRXXQUldclGDW08vLYEqUnAY08QvizmjaOZNkC+43o=",
 )
 ```
 
